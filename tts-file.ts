@@ -53,6 +53,46 @@ function parseArgs(argv: string[]) {
   };
   const has = (flag: string) => args.includes(flag);
 
+  if (has("--help") || has("-h")) {
+    console.log(`
+tts-file — Convert text to speech via ElevenLabs and send as Telegram voice message.
+
+INPUT (priority order):
+  stdin (default)       Pipe or heredoc — no shell escaping needed
+  --text "<text>"       Inline text argument
+  --file <path>         Read from file
+
+OPTIONS:
+  --output <path>       Output .ogg file path (default: derived from --file, or /tmp/tts-output.ogg)
+  --send                Send to Telegram after generation
+  --chat-id <id>        Telegram chat ID (default: from openclaw.json)
+  --caption "<text>"    Caption for the Telegram voice message
+  -l, --lang <code>     Language code override, e.g. "it", "en" (default: from openclaw.json)
+  --voice <id>          ElevenLabs voice ID override (default: from openclaw.json)
+  --model <id>          ElevenLabs model ID override, e.g. "eleven_multilingual_v2" (default: from openclaw.json)
+  -h, --help            Show this help
+
+EXAMPLES:
+  # Heredoc (recommended for long or complex text)
+  tsx tts-file.ts --output /tmp/out.ogg --send --caption "Capitolo 1" << 'ENDOFTEXT'
+  Il testo va qui, anche con "virgolette" e caratteri speciali.
+  ENDOFTEXT
+
+  # Inline text (short texts)
+  tsx tts-file.ts --text "Ciao mondo" --send --caption "Test"
+
+  # From file
+  tsx tts-file.ts --file /tmp/chapter1.txt --send --caption "Capitolo 1"
+
+  # Override language, voice and model
+  tsx tts-file.ts --file /tmp/text.txt --send -l en --voice <voice-id> --model eleven_multilingual_v2
+
+LIMITS:
+  Max 40,000 characters per request. If exceeded, exits with code 2 and prints [AI_INSTRUCTION].
+`);
+    process.exit(0);
+  }
+
   const file = get("--file");
   const text = get("--text");
 
