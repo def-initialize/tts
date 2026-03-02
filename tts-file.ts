@@ -63,8 +63,9 @@ function parseArgs(argv: string[]) {
   const send = has("--send");
   const lang = get("-l", "--lang");
   const voice = get("--voice");
+  const model = get("--model");
 
-  return { file, text, output, chatId, caption, send, lang, voice };
+  return { file, text, output, chatId, caption, send, lang, voice, model };
 }
 
 // ── Stdin ─────────────────────────────────────────────────────────────────────
@@ -89,17 +90,18 @@ async function synthesize(
   text: string,
   outputPath: string,
   cfg: ReturnType<typeof loadConfig>,
-  overrides?: { lang?: string; voice?: string }
+  overrides?: { lang?: string; voice?: string; model?: string }
 ): Promise<void> {
   const client = new ElevenLabsClient({ apiKey: cfg.apiKey });
   const voiceId = overrides?.voice ?? cfg.voiceId;
+  const modelId = overrides?.model ?? cfg.modelId;
   const languageCode = overrides?.lang ?? cfg.languageCode;
 
-  console.log(`⏳ ElevenLabs TTS (voice: ${voiceId}, model: ${cfg.modelId}, lang: ${languageCode ?? "auto"}) ...`);
+  console.log(`⏳ ElevenLabs TTS (voice: ${voiceId}, model: ${modelId}, lang: ${languageCode ?? "auto"}) ...`);
 
   const audioStream = await client.textToSpeech.convert(voiceId, {
     text,
-    modelId: cfg.modelId,
+    modelId,
     outputFormat: "opus_48000_32",
     ...(languageCode ? { languageCode } : {}),
   });
@@ -193,7 +195,7 @@ async function main() {
 
   console.log(`🎙️  Output: ${output}`);
 
-  await synthesize(text, output, cfg, { lang, voice });
+  await synthesize(text, output, cfg, { lang, voice, model });
 
   if (send) {
     if (!cfg.botToken) {

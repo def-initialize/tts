@@ -43,6 +43,7 @@ Text input is resolved in this order of priority:
 | `--caption <text>` | Caption for the voice message | — |
 | `-l` / `--lang <code>` | Language code override (e.g. `it`, `en`) | from `openclaw.json` |
 | `--voice <id>` | ElevenLabs voice ID override | from `openclaw.json` |
+| `--model <id>` | ElevenLabs model ID override (e.g. `eleven_multilingual_v2`) | from `openclaw.json` |
 
 ## Usage examples
 
