@@ -21,31 +21,41 @@ npm install          # installs @elevenlabs/elevenlabs-js
 npm install -g tsx   # TypeScript runner
 ```
 
-## Usage
+## Input methods
 
-```bash
-tsx tts-file.ts --file <path> [options]
-```
+Text input is resolved in this order of priority:
 
-### Options
+| Method | How |
+|--------|-----|
+| **stdin** (default) | pipe or heredoc — no escaping needed |
+| `--text "<text>"` | inline argument, for short simple texts |
+| `--file <path>` | read from file |
+
+## Options
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--file <path>` | Text file to convert (required) | — |
-| `--output <path>` | Output audio file path | same name as input, `.ogg` |
+| `--file <path>` | Read text from file | — |
+| `--text "<text>"` | Inline text input | — |
+| `--output <path>` | Output audio file path | derived from `--file`, or `/tmp/tts-output.ogg` |
 | `--send` | Send to Telegram after generation | false |
-| `--chat-id <id>` | Telegram chat ID | Stefano's ID (from config) |
+| `--chat-id <id>` | Telegram chat ID | from `openclaw.json` |
 | `--caption <text>` | Caption for the voice message | — |
 | `-l` / `--lang <code>` | Language code override (e.g. `it`, `en`) | from `openclaw.json` |
 | `--voice <id>` | ElevenLabs voice ID override | from `openclaw.json` |
 
-### Examples
+## Usage examples
 
 ```bash
-# Generate audio only
-tsx tts-file.ts --file /tmp/chapter1.txt
+# Heredoc (default — no escaping, handles any text)
+tsx tts-file.ts --output /tmp/out.ogg --send --caption "Capitolo 1" << 'ENDOFTEXT'
+Il testo va qui, anche con "virgolette" e $caratteri speciali.
+ENDOFTEXT
 
-# Generate and send to Telegram
+# Inline text (short texts)
+tsx tts-file.ts --text "Ciao mondo" --send --caption "Test"
+
+# From file
 tsx tts-file.ts --file /tmp/chapter1.txt --send --caption "Capitolo 1"
 
 # Override language and voice

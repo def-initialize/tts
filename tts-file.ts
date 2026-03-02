@@ -1,15 +1,19 @@
 #!/usr/bin/env tsx
 /**
- * tts-file.ts — Convert a text file to speech via ElevenLabs
- * and optionally send as a Telegram voice message.
+ * tts-file.ts — Convert text to speech via ElevenLabs and optionally send as a Telegram voice message.
+ *
+ * Input (in order of priority):
+ *   1. stdin (default) — pipe or heredoc, no escaping needed
+ *   2. --text "<text>"  — inline argument
+ *   3. --file <path>    — read from file
  *
  * Usage:
- *   tsx tts-file.ts --file <path> [--output <path>] [--send] [--chat-id <id>] [--caption <text>]
+ *   tsx tts-file.ts [--output <path>] [--send] [--caption <text>] [-l <lang>] [--voice <id>] << 'EOF'
+ *   <text here>
+ *   EOF
  *
- * Examples:
- *   tsx tts-file.ts --file capitolo1.txt
- *   tsx tts-file.ts --file capitolo1.txt --send
- *   tsx tts-file.ts --file capitolo1.txt --send --caption "Capitolo 1: Mi dispiace, Dave"
+ *   tsx tts-file.ts --text "Ciao mondo" --send --caption "Test"
+ *   tsx tts-file.ts --file capitolo1.txt --send --caption "Capitolo 1"
  */
 
 import { ElevenLabsClient } from "@elevenlabs/elevenlabs-js";
@@ -50,22 +54,29 @@ function parseArgs(argv: string[]) {
   const has = (flag: string) => args.includes(flag);
 
   const file = get("--file");
-  if (!file) {
-    console.error(
-      "Usage: tsx tts-file.ts --file <path> [--output <path>] [--send] [--chat-id <id>] [--caption <text>] [-l <lang>] [--voice <id>]"
-    );
-    process.exit(1);
-  }
+  const text = get("--text");
 
   const outputArg = get("--output");
-  const output = outputArg ?? file.replace(/\.[^.]+$/, "") + ".ogg";
+  const output = outputArg ?? (file ? file.replace(/\.[^.]+$/, "") + ".ogg" : "/tmp/tts-output.ogg");
   const chatId = get("--chat-id");
   const caption = get("--caption");
   const send = has("--send");
   const lang = get("-l", "--lang");
   const voice = get("--voice");
 
-  return { file, output, chatId, caption, send, lang, voice };
+  return { file, text, output, chatId, caption, send, lang, voice };
+}
+
+// ── Stdin ─────────────────────────────────────────────────────────────────────
+
+function readStdin(): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk) => (data += chunk));
+    process.stdin.on("end", () => resolve(data.trim()));
+    process.stdin.on("error", reject);
+  });
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -141,22 +152,41 @@ async function sendVoice(
 
 async function main() {
   const cfg = loadConfig();
-  const { file, output, chatId, caption, send, lang, voice } = parseArgs(process.argv);
+  const { file, text: inlineText, output, chatId, caption, send, lang, voice } = parseArgs(process.argv);
 
-  const text = readFileSync(file, "utf8").trim();
-  console.log(`📄 Input: ${file} (${text.length} chars)`);
+  let text: string;
+  let source: string;
+
+  if (inlineText !== undefined) {
+    text = inlineText.trim();
+    source = `--text (${text.length} chars)`;
+  } else if (file !== undefined) {
+    text = readFileSync(file, "utf8").trim();
+    source = `${file} (${text.length} chars)`;
+  } else {
+    text = await readStdin();
+    source = `stdin (${text.length} chars)`;
+    if (!text) {
+      console.error("❌ No input: provide text via stdin, --text, or --file.");
+      process.exit(1);
+    }
+  }
+
+  console.log(`📄 Input: ${source}`);
 
   if (text.length > ELEVENLABS_MAX_CHARS) {
     console.error(
       `\n⚠️  TEXT_TOO_LONG: ${text.length} chars exceeds the ElevenLabs limit of ${ELEVENLABS_MAX_CHARS}.\n` +
-      `\n[AI_INSTRUCTION] The file "${file}" is too long for a single TTS request.\n` +
-      `Split it into logical sections (e.g. by ## chapter headings), save each section\n` +
-      `to a temporary file under /tmp/, then call this script once per section.\n` +
+      `\n[AI_INSTRUCTION] The input text is too long for a single TTS request.\n` +
+      `Split it into logical sections (e.g. by chapter/heading boundaries) and call this script\n` +
+      `once per section using heredoc (stdin) to avoid shell escaping issues.\n` +
       `Example:\n` +
-      `  echo "<chapter 1 text>" > /tmp/cap1.txt\n` +
-      `  tsx tts-file.ts --file /tmp/cap1.txt --output /tmp/cap1.ogg --send --caption "Capitolo 1"\n` +
-      `  echo "<chapter 2 text>" > /tmp/cap2.txt\n` +
-      `  tsx tts-file.ts --file /tmp/cap2.txt --output /tmp/cap2.ogg --send --caption "Capitolo 2"`
+      `  tsx tts-file.ts --output /tmp/part1.ogg --send --caption "Parte 1" << 'ENDOFTEXT'\n` +
+      `  <section 1 text>\n` +
+      `  ENDOFTEXT\n` +
+      `  tsx tts-file.ts --output /tmp/part2.ogg --send --caption "Parte 2" << 'ENDOFTEXT'\n` +
+      `  <section 2 text>\n` +
+      `  ENDOFTEXT`
     );
     process.exit(2);
   }
