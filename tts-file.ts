@@ -2,6 +2,10 @@
 /**
  * tts-file.ts — Convert text to speech via ElevenLabs and optionally send as a Telegram voice message.
  *
+ * Accepts text of any length: splits it into chunks automatically, uses ElevenLabs
+ * Request Stitching (when supported by the model) to maintain voice prosody, then
+ * concatenates all chunks into a single audio file.
+ *
  * Input (in order of priority):
  *   1. stdin (default) — pipe or heredoc, no escaping needed
  *   2. --text "<text>"  — inline argument
@@ -21,10 +25,14 @@ import { createWriteStream, readFileSync, statSync } from "fs";
 import { Readable } from "stream";
 import * as path from "path";
 import * as fs from "fs";
+import * as os from "os";
+import { execSync } from "child_process";
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
+const SCRIPT_DIR = path.dirname(new URL(import.meta.url).pathname);
 const OC_CONFIG_PATH = "/root/.openclaw/openclaw.json";
+const MODELS_CONFIG_PATH = path.join(SCRIPT_DIR, "tts-models.json");
 
 function loadConfig() {
   const raw = JSON.parse(readFileSync(OC_CONFIG_PATH, "utf8"));
@@ -38,6 +46,29 @@ function loadConfig() {
     botToken: telegram.botToken,
     defaultChatId: "8401539866",
   };
+}
+
+// ── Model info ────────────────────────────────────────────────────────────────
+
+interface ModelInfo {
+  maxChars: number;
+  supportsStitching: boolean;
+}
+
+interface ModelsConfig {
+  eleven_labs: {
+    models: Record<string, ModelInfo>;
+  };
+}
+
+function getModelInfo(modelId: string): ModelInfo {
+  const config: ModelsConfig = JSON.parse(readFileSync(MODELS_CONFIG_PATH, "utf8"));
+  const info = config.eleven_labs?.models?.[modelId];
+  if (!info) {
+    console.warn(`⚠️  Model "${modelId}" not found in tts-models.json — defaulting to 40k chars, stitching: true`);
+    return { maxChars: 40_000, supportsStitching: true };
+  }
+  return info;
 }
 
 // ── Args ──────────────────────────────────────────────────────────────────────
@@ -57,6 +88,10 @@ function parseArgs(argv: string[]) {
     console.log(`
 tts-file — Convert text to speech via ElevenLabs and send as Telegram voice message.
 
+Accepts text of any length. Splits into chunks automatically using sentence
+boundaries (.) and uses ElevenLabs Request Stitching to maintain prosody.
+All chunks are concatenated into a single audio file before sending.
+
 INPUT (priority order):
   stdin (default)       Pipe or heredoc — no shell escaping needed
   --text "<text>"       Inline text argument
@@ -69,7 +104,7 @@ OPTIONS:
   --caption "<text>"    Caption for the Telegram voice message
   -l, --lang <code>     Language code override, e.g. "it", "en" (default: from openclaw.json)
   --voice <id>          ElevenLabs voice ID override (default: from openclaw.json)
-  --model <id>          ElevenLabs model ID override, e.g. "eleven_multilingual_v2" (default: from openclaw.json)
+  --model <id>          ElevenLabs model ID override (default: from openclaw.json)
   -h, --help            Show this help
 
 EXAMPLES:
@@ -87,15 +122,19 @@ EXAMPLES:
   # Override language, voice and model
   tsx tts-file.ts --file /tmp/text.txt --send -l en --voice <voice-id> --model eleven_multilingual_v2
 
-LIMITS:
-  Max 40,000 characters per request. If exceeded, exits with code 2 and prints [AI_INSTRUCTION].
+MODELS:
+  Model limits and stitching support are defined in tts-models.json.
+  Current models:
+    eleven_turbo_v2_5      40,000 chars/chunk  stitching: yes
+    eleven_flash_v2_5      40,000 chars/chunk  stitching: yes
+    eleven_multilingual_v2 10,000 chars/chunk  stitching: yes
+    eleven_v3               5,000 chars/chunk  stitching: no
 `);
     process.exit(0);
   }
 
   const file = get("--file");
   const text = get("--text");
-
   const outputArg = get("--output");
   const output = outputArg ?? (file ? file.replace(/\.[^.]+$/, "") + ".ogg" : "/tmp/tts-output.ogg");
   const chatId = get("--chat-id");
@@ -120,11 +159,63 @@ function readStdin(): Promise<string> {
   });
 }
 
-// ── Constants ─────────────────────────────────────────────────────────────────
+// ── Text splitting ────────────────────────────────────────────────────────────
 
-const ELEVENLABS_MAX_CHARS = 40_000;
+/**
+ * Splits text into chunks of at most `maxChars` characters.
+ * Splits at the last sentence-ending punctuation (. ! ?) before the limit.
+ * Falls back to the last space (word boundary) if no sentence boundary is found.
+ * Falls back to a hard cut only if there is no space at all.
+ */
+function splitText(text: string, maxChars: number): string[] {
+  if (text.length <= maxChars) return [text];
 
-// ── TTS ───────────────────────────────────────────────────────────────────────
+  const chunks: string[] = [];
+  let pos = 0;
+
+  while (pos < text.length) {
+    const remaining = text.length - pos;
+    if (remaining <= maxChars) {
+      chunks.push(text.slice(pos).trim());
+      break;
+    }
+
+    const slice = text.slice(pos, pos + maxChars);
+
+    // Find last sentence boundary (. ! ?) followed by whitespace or end-of-slice
+    let splitAt = -1;
+    for (let i = slice.length - 1; i >= 0; i--) {
+      const ch = slice[i];
+      if (ch === "." || ch === "!" || ch === "?") {
+        const next = slice[i + 1];
+        if (next === undefined || /\s/.test(next)) {
+          splitAt = i + 1; // include the punctuation
+          break;
+        }
+      }
+    }
+
+    // Fallback: last space (word boundary)
+    if (splitAt === -1) {
+      splitAt = slice.lastIndexOf(" ");
+    }
+
+    // Last resort: hard cut
+    if (splitAt === -1) {
+      splitAt = maxChars;
+    }
+
+    chunks.push(text.slice(pos, pos + splitAt).trim());
+    pos += splitAt;
+
+    // Skip leading whitespace before next chunk
+    while (pos < text.length && /\s/.test(text[pos])) pos++;
+  }
+
+  return chunks.filter((c) => c.length > 0);
+}
+
+// ── TTS with stitching ────────────────────────────────────────────────────────
 
 async function synthesize(
   text: string,
@@ -136,25 +227,100 @@ async function synthesize(
   const voiceId = overrides?.voice ?? cfg.voiceId;
   const modelId = overrides?.model ?? cfg.modelId;
   const languageCode = overrides?.lang ?? cfg.languageCode;
+  const modelInfo = getModelInfo(modelId);
 
-  console.log(`⏳ ElevenLabs TTS (voice: ${voiceId}, model: ${modelId}, lang: ${languageCode ?? "auto"}) ...`);
+  const chunks = splitText(text, modelInfo.maxChars);
+  const totalChunks = chunks.length;
 
-  const audioStream = await client.textToSpeech.convert(voiceId, {
-    text,
-    modelId,
-    outputFormat: "opus_48000_32",
-    ...(languageCode ? { languageCode } : {}),
-  });
+  console.log(
+    `🎙️  Model: ${modelId} | max ${modelInfo.maxChars} chars/chunk | ` +
+    `stitching: ${modelInfo.supportsStitching} | chunks: ${totalChunks}`
+  );
 
-  await new Promise<void>((resolve, reject) => {
+  // Single chunk: simple path, no temp files needed
+  if (totalChunks === 1) {
+    console.log(`⏳ Single chunk (${chunks[0].length} chars) ...`);
+    const audioStream = await client.textToSpeech.convert(voiceId, {
+      text: chunks[0],
+      modelId,
+      outputFormat: "opus_48000_32",
+      ...(languageCode ? { languageCode } : {}),
+    });
+    await streamToFile(audioStream, outputPath);
+    console.log(`✅ Saved: ${outputPath} (${(statSync(outputPath).size / 1024).toFixed(1)} KB)`);
+    return;
+  }
+
+  // Multiple chunks: use temp dir
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "tts-"));
+  const chunkPaths: string[] = [];
+  const requestIds: string[] = [];
+
+  try {
+    for (let i = 0; i < totalChunks; i++) {
+      const chunk = chunks[i];
+      const chunkPath = path.join(tmpDir, `chunk_${i}.ogg`);
+      chunkPaths.push(chunkPath);
+
+      console.log(`⏳ Chunk ${i + 1}/${totalChunks} (${chunk.length} chars) ...`);
+
+      if (modelInfo.supportsStitching) {
+        const response = await client.textToSpeech
+          .convert(voiceId, {
+            text: chunk,
+            modelId,
+            outputFormat: "opus_48000_32",
+            ...(languageCode ? { languageCode } : {}),
+            ...(requestIds.length > 0 ? { previousRequestIds: requestIds.slice(-3) } : {}),
+          })
+          .withRawResponse();
+
+        const requestId = response.rawResponse.headers.get("request-id");
+        if (requestId) requestIds.push(requestId);
+
+        const buffers: Buffer[] = [];
+        for await (const data of response.data as AsyncIterable<Uint8Array>) {
+          buffers.push(Buffer.from(data));
+        }
+        fs.writeFileSync(chunkPath, Buffer.concat(buffers));
+      } else {
+        const audioStream = await client.textToSpeech.convert(voiceId, {
+          text: chunk,
+          modelId,
+          outputFormat: "opus_48000_32",
+          ...(languageCode ? { languageCode } : {}),
+        });
+        await streamToFile(audioStream, chunkPath);
+      }
+
+      console.log(`  ✅ Chunk ${i + 1} saved (${(statSync(chunkPath).size / 1024).toFixed(1)} KB)`);
+    }
+
+    // Concatenate with ffmpeg
+    const listPath = path.join(tmpDir, "list.txt");
+    fs.writeFileSync(listPath, chunkPaths.map((p) => `file '${p}'`).join("\n"));
+
+    console.log(`🔗 Concatenating ${totalChunks} chunks ...`);
+    execSync(
+      `ffmpeg -y -f concat -safe 0 -i "${listPath}" -c:a libopus -b:a 32k "${outputPath}"`,
+      { stdio: "pipe" }
+    );
+
+    console.log(`✅ Saved: ${outputPath} (${(statSync(outputPath).size / 1024).toFixed(1)} KB)`);
+  } finally {
+    // Always clean up temp dir
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    console.log(`🗑️  Temp files cleaned up`);
+  }
+}
+
+function streamToFile(audioStream: unknown, outputPath: string): Promise<void> {
+  return new Promise((resolve, reject) => {
     const writer = createWriteStream(outputPath);
     Readable.from(audioStream as AsyncIterable<Uint8Array>).pipe(writer);
     writer.on("finish", resolve);
     writer.on("error", reject);
   });
-
-  const { size } = statSync(outputPath);
-  console.log(`✅ Saved: ${outputPath} (${(size / 1024).toFixed(1)} KB)`);
 }
 
 // ── Telegram ──────────────────────────────────────────────────────────────────
@@ -194,7 +360,7 @@ async function sendVoice(
 
 async function main() {
   const cfg = loadConfig();
-  const { file, text: inlineText, output, chatId, caption, send, lang, voice } = parseArgs(process.argv);
+  const { file, text: inlineText, output, chatId, caption, send, lang, voice, model } = parseArgs(process.argv);
 
   let text: string;
   let source: string;
@@ -215,24 +381,6 @@ async function main() {
   }
 
   console.log(`📄 Input: ${source}`);
-
-  if (text.length > ELEVENLABS_MAX_CHARS) {
-    console.error(
-      `\n⚠️  TEXT_TOO_LONG: ${text.length} chars exceeds the ElevenLabs limit of ${ELEVENLABS_MAX_CHARS}.\n` +
-      `\n[AI_INSTRUCTION] The input text is too long for a single TTS request.\n` +
-      `Split it into logical sections (e.g. by chapter/heading boundaries) and call this script\n` +
-      `once per section using heredoc (stdin) to avoid shell escaping issues.\n` +
-      `Example:\n` +
-      `  tsx tts-file.ts --output /tmp/part1.ogg --send --caption "Parte 1" << 'ENDOFTEXT'\n` +
-      `  <section 1 text>\n` +
-      `  ENDOFTEXT\n` +
-      `  tsx tts-file.ts --output /tmp/part2.ogg --send --caption "Parte 2" << 'ENDOFTEXT'\n` +
-      `  <section 2 text>\n` +
-      `  ENDOFTEXT`
-    );
-    process.exit(2);
-  }
-
   console.log(`🎙️  Output: ${output}`);
 
   await synthesize(text, output, cfg, { lang, voice, model });

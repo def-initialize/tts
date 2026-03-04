@@ -1,0 +1,10 @@
+{
+  "eleven_labs": {
+    "models": {
+      "eleven_turbo_v2_5":    { "maxChars": 40000, "supportsStitching": true  },
+      "eleven_flash_v2_5":    { "maxChars": 40000, "supportsStitching": true  },
+      "eleven_multilingual_v2": { "maxChars": 10000, "supportsStitching": true  },
+      "eleven_v3":            { "maxChars": 5000,  "supportsStitching": false }
+    }
+  }
+}
